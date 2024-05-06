@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() {
+    echo "$(date +%T) $(basename "${0}"): ${1:-log() argument missing}"
+}
+log_err() {
+    log "${1:-log_err() argument missing}" >&2
+}
+die() {
+    log_err "${1-die() argument missing}"
+    exit 1
+}
+die_usage() {
+    log_err "${1-die() argument missing}"
+    usage
+    exit 1
+}
+usage() {
+    cat << EOF
+Usage:
+  $(basename "${0}") -i INPUT_FILE [optional arguments]
+
+  Required:
+    -i | --input INPUT_FILE     - input file
+
+  Optional:
+    -o | --output OUTPUT_FILE   - output file (default is same as input with the
+                                  extension changed to "png")
+    -f | --force                - force overwrite output file
+
+    -t | --title TITLE          - title (default is "artist / album / title" or
+                                  the filename if metadata is not available)
+    -s | --size SIZE            - size (default is 1200x600)
+    --no-psr                    - don't graph peak-to-short-term ratio
+
+    -h | --help                 - this help message
+
+The script uses ffmpeg to get loudness data of the input file and then uses
+gnuplot to generate a graph and write it to png file.
+
+Peak-to-short-term ratio is calculated as a difference between max peak in a
+window and short-term loudness at the end of the window. The size of the window
+is calculated so that there are 200 windows in total.
+EOF
+}
+declare -ra required_cmds=(gnuplot ffmpeg ffprobe grep sed awk bc tr)
+for cmd in "${required_cmds[@]}"; do
+    if ! which "${cmd}" >/dev/null 2>&1; then
+        log "Required tools: ${required_cmds[*]}"
+        die "Required tool not found: ${cmd}"
+    fi
+done
+
+input_file=""
+output_file=""
+force="no"
+title=""
+size="1200x600"
+is_psr="yes"
+while [ -n "${1-}" ]; do
+    case "${1}" in
+        -i|--input| \
+        -o|--output| \
+        -t|--title| \
+        -s|--size)
+            if [ ! $# -ge 2 ]; then
+                die_usage "Argument missing for option ${1}"
+            fi
+        ;;
+    esac
+    case "${1}" in
+        -i|--input)
+            input_file="${2}"
+            shift
+        ;;
+        -o|--output)
+            output_file="${2}"
+            shift
+        ;;
+        -t|--title)
+            title="${2}"
+            shift
+        ;;
+        -s|--size)
+            size="${2}"
+            shift
+        ;;
+        -f|--force)
+            force="yes"
+        ;;
+        --no-psr)
+            is_psr="no"
+        ;;
+        -h|--help)
+            usage
+            exit 0
+        ;;
+        *)
+            die_usage "Unknown command line option: ${1}"
+        ;;
+    esac
+    shift
+done
+
+if [ -z "${input_file}" ]; then
+    die_usage "Input file is required."
+fi
+if [ ! -f "${input_file}" ]; then
+    die "File ${input_file} doesn't exist."
+fi
+if [ -z "${output_file}" ]; then
+    output_file="${input_file%.*}.png"
+fi
+if [ -f "${output_file}" ] && [ "${force}" != "yes" ]; then
+    die "File ${output_file} already exists. Use -f | --force to overwrite."
+fi
+
+size_regex="^[0-9]+x[0-9]+$"
+if [[ "${size}" =~ ${size_regex} ]]; then
+    width="$(echo "${size}" | cut -d'x' -f1)"
+    height="$(echo "${size}" | cut -d'x' -f2)"
+else
+    die_usage "Wrong size format: ${size}"
+fi
+
+tmp_dir=$(mktemp -d)
+trap 'rm -rf "${tmp_dir}"' EXIT
+
+
+
+duration=$(ffprobe -i "${input_file}" -show_entries format=duration -v quiet -of csv="p=0")
+
+
+
+declare -r metadata_file="${tmp_dir}/metadata.txt"
+read_metadata() {
+    local tag="${1}"
+    grep -i "^${tag}=" "${metadata_file}" | cut -d'=' -f2- || true
+}
+if [ -z "${title}" ]; then
+    ffmpeg -loglevel error -y -i "${input_file}" -f ffmetadata "${metadata_file}"
+    title="$(read_metadata "title")"
+    if [ -z "${title}" ]; then
+        title="${input_file##*/}"
+    else
+        track="$(read_metadata "track")"
+        if [ -n "${track}" ]; then
+            title="${track}. ${title}"
+            disc="$(read_metadata "disc")"
+            if [ -n "${disc}" ]; then
+                title="${disc}-${title}"
+            fi
+        fi
+        album="$(read_metadata "album")"
+        artist="$(read_metadata "artist")"
+
+        title="${artist:-unknown} / ${album:-unknown} / ${title}"
+    fi
+    log "Title will be: ${title}"
+fi
+
+
+
+declare -r ff_out_file="${tmp_dir}/ff.out"
+log "ffmpeg ebur128..."
+ffmpeg -nostats -hide_banner -i "${input_file}" -af ebur128=peak=true:dualmono=true -f null - >"${ff_out_file}" 2>&1
+log "ffmpeg ebur128 done"
+
+
+
+declare -r ff_out_summary_file="${tmp_dir}/ff.out.summary"
+sed -n '/Summary/,$ p' "${ff_out_file}" > "${ff_out_summary_file}"
+read_summary() {
+    local field="${1}"
+    grep -F "${field}" "${ff_out_summary_file}" | cut -d':' -f2 | tr -cd '0-9-.'
+}
+ lufsi=$(read_summary "I:")
+   lra=$(read_summary "LRA:")
+lra_lo=$(read_summary "LRA low:")
+lra_hi=$(read_summary "LRA high:")
+
+
+
+# For peak-to-short-term I want to have boxes with color depending on the ratio. If I calculate it for each frame and
+# try to plot, it will all smoosh together. So I want always to only have 200 of them. For that I calculate a here a
+# psr_window in terms of frames and then peak-to-short-term will be calculated once per window. Below, in the awk
+# script, the PSR is calculated as a difference between max peak in the window and short-term loudness at the end of
+# the window.
+# psr_offset is half of the window in terms of seconds. That's used in the gnuplot file to place the box properly.
+# Gnuplot draws a box centered on the x coordinate. The value for the window in the data file is stored at the end of
+# the window. Shifting by half of the window will put the box in the correct place.
+psr_window=$(echo "scale=0; ${duration} * 10 / 200" | bc -l)
+log "psr_window = $psr_window frames"
+psr_offset=$(echo "${psr_window} / 2 / 10 * -1" | bc -l)
+
+declare -r ff_out_frames_file="${tmp_dir}/ff.out.frames"
+declare -r loudness_dat_file="${tmp_dir}/loudness.dat"
+grep -F "Parsed_ebur128" "${ff_out_file}" | grep -F "] t:" > "${ff_out_frames_file}"
+#cat "${ff_out_frames_file}" | tail
+awk -v "psr_window=${psr_window}" '
+function logger(msg) {
+    print "awk: " msg
+}
+function getField(line, fieldName,    result, fieldNameLen) {
+    result = "-"
+    match(line, fieldName " *-?[0-9.]+")
+    if (RSTART > 0) {
+        fieldNameLen = length(fieldName)
+        result = substr(line, RSTART + fieldNameLen, RLENGTH - fieldNameLen)
+        sub(/^ */, "", result)
+        result = result + 0
+    }
+    return result
+}
+function getFTPK(line,    result, fieldNameLen, parts) {
+    result = "-"
+    match(line, /FTPK: +-?[0-9.]+ +-?[0-9.]+/)
+    if (RSTART > 0) {
+        fieldNameLen = 5
+        result = substr(line, RSTART + fieldNameLen, RLENGTH - fieldNameLen)
+        split(result, parts)
+        result = (parts[1] > parts[2]) ? parts[1] : parts[2]
+    }
+    return result
+}
+BEGIN {
+    cnt = 0
+    max_peak = -120
+}
+{
+    f_time = getField($0, "t:")
+    f_m = getField($0, "M:")
+    f_s = getField($0, "S:")
+    f_i = getField($0, "I:")
+    f_lra = getField($0, "LRA:")
+    f_peak = getFTPK($0)
+    if (f_peak = "-") {
+        f_peak = getField($0, "FTPK:")
+    }
+
+    if (f_time < 4) {
+        # there is always some strange jump at the beginning of 3rd second, so reset to zero in the first 4 seconds
+        f_lra = 0
+    }
+    if (f_peak > max_peak) {
+        max_peak = f_peak
+    }
+
+    # calculate peak-to-short-term as a difference between max-peak in the window and short-term at the end of the window
+    cnt++
+    f_psr = "-"
+    if (f_time > 3 && cnt >= psr_window && f_s > -70) {
+        f_psr = max_peak - f_s
+        if (f_psr > 21) {
+            f_psr = 21
+        }
+        cnt = 0
+        max_peak = -120
+    }
+    printf("%11s %6s %6s %6s %6s %6s %6s\n", f_time, f_m, f_s, f_i, f_lra, f_peak, f_psr)
+}
+' "${ff_out_frames_file}" > "${loudness_dat_file}"
+#cat "${loudness_dat_file}" | head -n200 || true
+
+
+
+declare -r loudness_gp_file="${tmp_dir}/loudness.gp"
+cat >"${loudness_gp_file}" <<'EOF'
+reset
+set terminal pngcairo truecolor size T_WIDTH, T_HEIGHT
+
+# remove border on top and set color to black
+set style line 11 lc rgb 'black' lt 1
+set border 11 front ls 11
+set tics front nomirror
+
+# define grid
+set style line 12 lc rgb '#303030' lt 0 lw 1
+set grid back ls 12
+
+set output "T_OUT"
+set style data lines
+
+set xlabel "Time"
+set ylabel "LUFS / dBFS"
+set mytics 2
+set y2label "LU / dB" offset -2,0
+set y2tics
+set my2tics 2
+
+set xrange [0:T_DURATION]
+set yrange [-60:6.5]
+set y2range [0:40]
+
+set xdata time
+# output format for labels
+set format x "%M:%S"
+# input format
+set timefmt "%s"
+
+set title "T_TITLE" noenhanced
+
+set key bmargin center
+set key Left reverse maxrows 2 width -5
+set bmargin 6   # to make a bigger space between xlabel and the key
+
+# the palette is red, red, orange, green, blue with saturation at 30%
+set palette defined (0 '#ffb3b3', 6 '#ffb3b3', 9 '#ffe4b3', 13 '#b3ffb3', 21 '#b3b3ff')
+set cbrange [0:21]
+unset colorbox
+
+# for psr
+cb_origin = (T_WIDTH-50.0)/T_WIDTH
+set colorbox vertical user origin cb_origin,0.25 size 0.01,0.6
+set cbtics offset -1,0
+set rmargin 12
+
+c_pk = '#e7a0fe'
+c_pk_over = 'red'
+c_m = '#9bb8ff'
+c_s = '#5585ff'
+c_i = '#dc267f'
+c_lra = '#ffb000'
+#c_lra_lo_hi = '#fff4db'
+c_lra_lo_hi = c_lra
+
+# fc - fillcolor
+# fs - fillstyle
+# lc - linecolor
+# lw - linewidth
+# 1: time, 2: momentary, 3: short-term, 4: integrated, 5: lra, 6: peak, 7: psr
+plot \
+  'T_DAT_FILE' using ($1 - T_PSR_OFFSET):7:7 axes x1y2 title 'peak-to-short-term' with boxes lc palette fs solid noborder, \
+  T_LRA_HI with filledcurves above y=T_LRA_LO title 'LRA: T_LRA_LO to T_LRA_HI LUFS' fc rgb c_lra_lo_hi fs transparent solid 0.2 noborder, \
+  'T_DAT_FILE' using 1:6 axes x1y1 title 'Peaks' lc rgb c_pk, \
+  'T_DAT_FILE' using 1:($6 > 0 ? $6 : 1/0) axes x1y1 notitle lc rgb c_pk_over lw 2, \
+  'T_DAT_FILE' using 1:2 axes x1y1 title 'Momentary' lc rgb c_m lw 1, \
+  'T_DAT_FILE' using 1:3 axes x1y1 title 'Short-term' lc rgb c_s lw 2, \
+  'T_DAT_FILE' using 1:4 axes x1y1 title 'Integrated: T_LUFSI LUFS' lc rgb c_i lw 2, \
+  'T_DAT_FILE' using 1:5 axes x1y2 title 'LRA: T_LRA LU' lc rgb c_lra lw 2
+EOF
+
+sanitize_for_sed() {
+    # escape / and & so that sed doesn't complain
+    # double escape " so that it is still escaped once in the gp file
+    echo "${1}" | sed 's/[/&]/\\&/g' | sed 's/"/\\\\"/g'
+}
+
+sed -i \
+    -e "s/T_WIDTH/${width}/g" \
+    -e "s/T_HEIGHT/${height}/g" \
+    -e "s/T_DURATION/${duration}/" \
+    -e "s/T_OUT/$(sanitize_for_sed "${output_file}")/" \
+    -e "s/T_TITLE/$(sanitize_for_sed "${title}")/" \
+    -e "s/T_LRA_HI/${lra_hi}/g" \
+    -e "s/T_LRA_LO/${lra_lo}/g" \
+    -e "s/T_LRA/${lra}/" \
+    -e "s/T_LUFSI/${lufsi}/" \
+    -e "s/T_DAT_FILE/$(sanitize_for_sed "${loudness_dat_file}")/" \
+    -e "s/T_PSR_OFFSET/${psr_offset}/" \
+    "${loudness_gp_file}"
+
+if [ "${is_psr}" = "no" ]; then
+    sed -i \
+        -e "/peak-to-short-term/ d" \
+        -e "/# for psr/,/^$/ d" \
+        "${loudness_gp_file}"
+fi
+
+#cat "${loudness_gp_file}"
+gnuplot "${loudness_gp_file}"
+
+log 'THE END'
