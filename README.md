@@ -4,7 +4,7 @@
 
 * [Intro](#intro)
 * [Usage](#usage)
-* [Examples](#esamples)
+* [Examples](#examples)
 
 </div>
 
