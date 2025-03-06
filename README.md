@@ -1,4 +1,4 @@
-**Table fo Contents**
+**Table of Contents**
 
 <div id="user-content-toc">
 
